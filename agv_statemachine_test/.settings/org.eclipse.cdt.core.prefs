@@ -1,0 +1,17 @@
+eclipse.preferences.version=1
+environment/project/0.654666996/ROS_MASTER_URI/delimiter=\:
+environment/project/0.654666996/ROS_MASTER_URI/operation=append
+environment/project/0.654666996/ROS_MASTER_URI/value=http\://localhost\:11311
+environment/project/0.654666996/VERBOSE/delimiter=\:
+environment/project/0.654666996/VERBOSE/operation=append
+environment/project/0.654666996/VERBOSE/value=
+environment/project/0.654666996/append=true
+environment/project/0.654666996/appendContributed=true
+environment/project/0.843697869/ROS_MASTER_URI/delimiter=\:
+environment/project/0.843697869/ROS_MASTER_URI/operation=append
+environment/project/0.843697869/ROS_MASTER_URI/value=http\://localhost\:11311
+environment/project/0.843697869/VERBOSE/delimiter=\:
+environment/project/0.843697869/VERBOSE/operation=append
+environment/project/0.843697869/VERBOSE/value=1
+environment/project/0.843697869/append=true
+environment/project/0.843697869/appendContributed=true

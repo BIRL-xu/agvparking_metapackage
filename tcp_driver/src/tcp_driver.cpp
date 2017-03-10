@@ -1,0 +1,633 @@
+/*
+ * tcp_driver.cpp
+ *
+ *  Created on: Dec 9, 2016
+ *      Author: paul
+ */
+#include "tcp_driver/tcp_driver.h"
+#include "agvparking_msg/QRInfo.h"
+#include "agvparking_msg/AgvOdom.h"
+ServerSocket::ServerSocket(boost::asio::io_service &io_sev, const int port):
+server_socket_(io_sev),acceptor_(io_sev, tcp::endpoint(tcp::v4(), port)),tcp_alive_(false),getQR_(false),odom_reset_(false),align_first_(false),
+aligned_(false),limit_vx_(0.0),limit_vy_(0.0), limit_vw_(0.0),nh_(ros::NodeHandle("~"))
+{
+  memset(vel4f_, 0.0, 4);
+  memset(vel_feedback_, 0.0, 3);
+  memset(sample_buff_, 0, 4);
+  memset(read_buff_, 0, 18);
+  last_pose_.x = last_pose_.y = 0.0;
+  current_time_ = last_time_ = ros::Time::now();
+
+  nh_.param("max_vx", limit_vx_, limit_vx_);
+  nh_.param("max_vy", limit_vy_, limit_vy_);
+  nh_.param("max_vw", limit_vw_, limit_vw_);
+  nh_.param("odom_reset", odom_reset_);
+  nh_.param("align_first", align_first_);
+  nh_.param("odom_scale_x", odom_scale_x_, 1.0);
+  nh_.param("odom_scale_y", odom_scale_y_, 1.0);
+  nh_.param("odom_scale_yaw", odom_scale_yaw_, 1.0);
+
+  //publish
+  odom_pub_ = nh_.advertise<nav_msgs::Odometry>("/odom", 10);             //for rviz
+  vel_pub_ = nh_.advertise<geometry_msgs::Twist>("feedback_vel", 5);
+  QR_odom_pub_ = nh_.advertise<agvparking_msg::AgvOdom>("/qr_odom", 5);  //for navigation.
+  //订阅cmd_vel
+  vel_sub_ = nh_.subscribe<geometry_msgs::Twist>("/cmd_vel", 5, &ServerSocket::velCallback, this);
+
+  listen_thrd_ptr_ = boost::shared_ptr<boost::thread>(new boost::thread(boost::bind(&ServerSocket::listenOnPort, this ))); //启动监听线程。
+  send_thrd_ptr_ = boost::shared_ptr<boost::thread>(new boost::thread(boost::bind(&ServerSocket::socketWrite, this )));
+  read_thrd_ptr_ = boost::shared_ptr<boost::thread>(new boost::thread(boost::bind(&ServerSocket::socketRead, this )));
+  read_handle_ptr_ = boost::shared_ptr<boost::thread>(new boost::thread(boost::bind(&ServerSocket::readDataHandle, this )));
+  odom_thrd_ = boost::shared_ptr<boost::thread>(new boost::thread(boost::bind(&ServerSocket::odom, this )));
+  align_ptr_ = boost::shared_ptr<boost::thread>(new boost::thread(boost::bind(&ServerSocket::alignInit, this)));
+}
+ServerSocket::~ServerSocket()
+{
+  if(server_socket_.is_open())
+    server_socket_.close();
+}
+//问题：怎么实现客户端关闭后再连接也能发送。
+//keepAlive?心跳包？
+void ServerSocket::listenOnPort()
+{
+  while(true)
+  {
+    boost::system::error_code error;
+    waitMilli(10);
+//    std::cout << "error:" << error.message() << std::endl;
+    acceptor_.accept(server_socket_,error);
+    if(!error)          //连接成功。
+      tcp_alive_ = true;
+    else
+    {
+ //     std::cout << "error:" << error.message() << std::endl;
+ //     tcp_alive_ = false;
+    }
+  }
+}
+void ServerSocket::socketWrite()
+{
+  boost::system::error_code write_error;
+  while(true)
+  {
+    if(!tcp_alive_)  //TCP连接存在时才发送数据。
+      continue;
+    waitMilli(20);   //50ms发一次。
+    //TODO:将cmd_vel的数据进行转换后赋给send_buffer.
+    Byte send_buffer[4]={0};
+    dataHandle();
+    if(cmdVel_mutex_.try_lock())
+    {
+      if(sizeof(send_buffer) == sizeof(sample_buff_))
+        memcpy(send_buffer, sample_buff_, sizeof(sample_buff_));
+      else
+        std::cout << "buffer size is not same!" << std::endl;
+      cmdVel_mutex_.unlock();
+    }
+  //  printf("cmd_vel=(%d,%d,%d)\n", send_buffer[0],send_buffer[1],send_buffer[2]);
+      server_socket_.write_some(boost::asio::buffer((Byte*)send_buffer, sizeof(send_buffer)), write_error);
+    if(write_error)                                                                                //write error.
+    {
+      std::cout << "Socket write fail." << std::endl;
+      throw boost::system::system_error(write_error);
+    }
+  }
+}
+
+//接收
+void ServerSocket::socketRead()
+{
+  boost::system::error_code read_error;
+  Byte read_buffer[18]={0};      //一次接收两个包的数据。
+  waitMilli(150);                     //150ms发一次。
+  while(true)
+  {
+    if(!tcp_alive_)  //TCP连接存在时才发送数据。
+      continue;
+    server_socket_.read_some(boost::asio::buffer((Byte*)read_buffer, sizeof(read_buffer)), read_error);
+    if(read_error)
+    {
+      std::cout << "Socket read fail." << std::endl;
+      throw boost::system::system_error(read_error);
+    }
+    else
+    {
+      if(read_mutex_.try_lock())
+      {
+        memcpy(read_buff_, read_buffer, sizeof(read_buff_));
+/*
+        printf("----------------\n");
+        printf("%02x\n", read_buff_[0]);
+        printf("%02x\n", read_buff_[1]);
+        printf("%02x\n", read_buff_[2]);
+        printf("%02x\n", read_buff_[3]);
+        printf("%02x\n", read_buff_[4]);
+        printf("%02x\n", read_buff_[5]);
+        printf("%02x\n", read_buff_[6]);
+        printf("%02x\n", read_buff_[7]);
+        printf("%02x\n", read_buff_[8]);
+
+        printf("%02x\n", read_buff_[9]);
+        printf("%02x\n", read_buff_[10]);
+        printf("%02x\n", read_buff_[11]);
+        printf("%02x\n", read_buff_[12]);
+        printf("%02x\n", read_buff_[13]);
+        printf("%02x\n", read_buff_[14]);
+        printf("%02x\n", read_buff_[15]);
+        printf("%02x\n", read_buff_[16]);
+        printf("%02x\n", read_buff_[17]);
+*/
+    //    readDataHandle();     //放到线程内调用。
+        read_mutex_.unlock();
+      }
+    }
+  }
+
+}
+
+void ServerSocket::velCallback(const geometry_msgs::Twist::ConstPtr &msg_ptr)
+{
+  if(cmdVel_mutex_.try_lock())
+  {
+    vel4f_[0] = (fabs(msg_ptr->linear.x) > limit_vx_)?(SIGN(msg_ptr->linear.x)*limit_vx_) : msg_ptr->linear.x;       //vx
+    vel4f_[1] = (fabs(msg_ptr->linear.y) > limit_vy_)?(SIGN(msg_ptr->linear.y)*limit_vy_) : msg_ptr->linear.y;       //vy
+    vel4f_[2] = (fabs(msg_ptr->angular.z) > limit_vw_)?(SIGN(msg_ptr->angular.z)*limit_vw_) : msg_ptr->angular.z;;   //w
+    vel4f_[3] = msg_ptr->linear.z;         //举升命令。
+    cmdVel_mutex_.unlock();
+  }
+}
+//real转换为Byte.
+void ServerSocket::dataHandle() //这个函数可以放到速度回调函数里面。
+{
+  if(cmdVel_mutex_.try_lock())
+  {
+    dataEx[0].int_num = (short int)(vel4f_[0] * 100);  //将real放大100倍后取整，便于数据传送。
+    dataEx[1].int_num = (short int)(vel4f_[1] * 100);
+    dataEx[2].int_num = (short int)(vel4f_[2] * 100);
+    dataEx[3].int_num = (short int)(vel4f_[3] * 100);
+
+    sample_buff_[0] = dataEx[0].data;
+    sample_buff_[1] = dataEx[1].data;
+    sample_buff_[2] = dataEx[2].data;
+    sample_buff_[3] = dataEx[3].data;
+    cmdVel_mutex_.unlock();
+  }
+}
+
+void ServerSocket::readDataHandle()
+{
+  while(true)
+  {
+    waitMilli(150);
+    unsigned short int vel_low_byte[3] = {0};
+    unsigned short int vel_high_byte[3] = {0};
+    unsigned int QR_x[3] = {0};                   //x方向的偏差；
+    unsigned short int QR_y[2] = {0};             //y方向的偏差；
+    unsigned short int QR_angle[2] = {0};         //角度偏差；[0,360°]
+    unsigned short int QR_num[2] = {0};
+    if(read_mutex_.try_lock())
+    {
+      if(read_buff_[0] == 0xAA)     //最后一个包是完整的。
+      {
+        //vx
+        vel_low_byte[0] = read_buff_[2];
+        vel_high_byte[0] = read_buff_[3];
+        //vy
+        vel_low_byte[1] = read_buff_[4];
+        vel_high_byte[1] = read_buff_[5];
+        //w
+        vel_low_byte[2] = read_buff_[6];
+        vel_high_byte[2] = read_buff_[7];
+        if(read_buff_[8] == 0xBB)        //识别到二维码。
+        {
+          //QR x
+          QR_x[0] = read_buff_[9];
+          QR_x[1] = read_buff_[10];
+          QR_x[2] = read_buff_[11];
+          //QR y
+          QR_y[0] = read_buff_[12];
+          QR_y[1] = read_buff_[13];
+          //QR angle
+          QR_angle[0] = read_buff_[14];
+          QR_angle[1] = read_buff_[15];
+          //QR num;
+          QR_num[0] = read_buff_[16];
+          QR_num[1] = read_buff_[17];
+        }
+        else
+        {
+          memset(QR_x, 0, 3);
+          memset(QR_y, 0, 2);
+          memset(QR_angle, 0, 2);
+          memset(QR_num, 0, 2);
+        }
+        read_mutex_.unlock();
+      }
+      else
+      {
+        read_mutex_.unlock();
+        continue;
+      }
+  /*    {
+        for(short int index = 7; index >= 0; --index)
+        {
+          if(read_buff_[index] == 0xAA)
+          {
+            //vx
+            low_byte[0] = read_buff_[index+2];
+            high_byte[0] = read_buff_[index+3] << 8;
+            //vy
+            low_byte[1] = read_buff_[index+4];
+            high_byte[1] = read_buff_[index+5] << 8;
+            //w
+            low_byte[2] = read_buff_[index+6];
+            high_byte[2] = read_buff_[index+7] << 8;
+            read_mutex_.unlock();
+            break;
+          }
+        }
+      }*/
+
+      unsigned short int vx_uint = vel_low_byte[0] | (vel_high_byte[0] << 8);  //将高低字节合并。
+      short int vx_int = (short int)vx_uint;
+
+      unsigned short int vy_uint = vel_low_byte[1] | (vel_high_byte[1] << 8);
+      short int vy_int = (short int)vy_uint;
+
+      unsigned short int w_uint = vel_low_byte[2] | (vel_high_byte[2] << 8);
+      short int w_int = (short int)w_uint;
+
+      feedbackVel_mutex_.lock();
+      //int转换为real.
+      vel_feedback_[0] = (float)vx_int / 1000.0;
+      vel_feedback_[1] = (float)vy_int / 1000.0;
+      vel_feedback_[2] = (float)w_int / 1000.0;
+
+      vel_feedback_[0] = (fabs(vel_feedback_[0])) < 0.001?0.0 : vel_feedback_[0];
+      vel_feedback_[1] = (fabs(vel_feedback_[1])) < 0.001?0.0 : vel_feedback_[1];
+      vel_feedback_[2] = (fabs(vel_feedback_[2])) < 0.001?0.0 : vel_feedback_[2];
+
+      //QR
+      QR_info_.x = (QR_x[2] << 16) | (QR_x[1] << 8) | QR_x[0] ;
+      QR_info_.y = (QR_y[1] << 8) | QR_y[0];
+      QR_info_.angle = (QR_angle[1] << 8) | QR_angle[0];
+      QR_info_.num = (QR_num[1] << 8) | QR_num[0];
+      if(QR_info_.num)
+        getQR_ = true;        //识别到二维码。
+      else
+        getQR_ = false;
+ //     printf("QR_info:(%d,%d,%d,%d)\n",QR_info_.x,QR_info_.y, QR_info_.angle,QR_info_.num);
+      qr_float_.x = QR_info_.x / 1000.0;        //m.
+      qr_float_.y = QR_info_.y / 1000.0;        //m.
+      qr_float_.angle = angleMapAndRad(QR_info_.angle); //rad.
+      qr_float_.num = QR_info_.num;
+      //topic message.
+
+      feedbackVel_mutex_.unlock();
+      //publish.
+      geometry_msgs::Twist vel;
+      vel.linear.x = vel_feedback_[0];
+      vel.linear.y = vel_feedback_[1];
+      vel.linear.z = 0.0;
+      vel.angular.x = 0.0;
+      vel.angular.y = 0.0;
+      vel.angular.z = vel_feedback_[2];
+      vel_pub_.publish(vel);            //发布反馈速度；
+      read_mutex_.unlock();
+    }
+  }
+}
+
+void ServerSocket::odom()
+{
+  while(true)
+  {
+    nh_.param("odom_reset", this->odom_reset_, false);
+    nh_.param("align_first", this->align_first_, false);
+    nh_.param("odom_scale_x", odom_scale_x_, 1.0);
+    nh_.param("odom_scale_y", odom_scale_y_, 1.0);
+    nh_.param("odom_scale_yaw", odom_scale_yaw_, 1.0);
+    current_time_ = ros::Time::now();
+    float vx = 0.0, vy = 0.0, vw = 0.0;
+    if(feedbackVel_mutex_.try_lock())
+    {
+      vx = vel_feedback_[0];
+      vy = vel_feedback_[1];
+      vw = vel_feedback_[2];
+      QRfloat qr_data = qr_float_;
+      feedbackVel_mutex_.unlock();
+      //calculate the displacement.
+      const float dt = (current_time_ - last_time_).toSec();
+      const float dx = vx * dt * odom_scale_x_;
+      const float dy = vy * dt * odom_scale_y_;
+      const float dtheta = vw * dt * odom_scale_yaw_;
+//      printf("(%.3f, %.3f, %.3f)\n", vx,vy,vw);
+      if(!aligned_)                     //调整还没有结束。
+        goto normal_odom;
+
+      if(getQR_)
+      {
+        //TODO:更新里程计。修正pose.
+        float dist_x = computeDist(pose_.x, last_pose_.x);
+        float dist_y = computeDist(pose_.y, last_pose_.y);
+        const float TravelDist = sqrt(dist_x*dist_x + dist_y*dist_y);   //距离上一个二维码行驶过的距离。
+        if(fabs(vx) > fabs(vy))                 //沿x轴方向移动。
+        {
+          if((vx > 0) && (dist_x > 0.15))        //行驶距离大于15cm才计入下一个二维码的信息，滤除多次计入同一二维码。
+          {
+            last_pose_.x += QRDISTANCE;
+         //   last_pose_.y = qr_float_.y;
+            pose_.x = last_pose_.x + qr_float_.x;
+            pose_.y = last_pose_.y + qr_float_.y;             //误差累计，要保持POSE_Y为原始值。
+            pose_.theta = qr_float_.angle;
+
+          }
+          else if((vx < 0) && (dist_x > 0.15))
+          {
+            last_pose_.x -= QRDISTANCE;
+           // last_pose_.y = qr_float_.y;
+            pose_.x = last_pose_.x + qr_float_.x;
+            pose_.y = last_pose_.y + qr_float_.y;
+            pose_.theta = qr_float_.angle;
+
+          }
+
+/*          if(fabs(dist_x) > QRDISTANCE/2.0)      //行驶距离大于15cm才计入下一个二维码的信息，滤除多次计入同一二维码。
+          {
+            if(vx > 0)
+              last_pose_.x += QRDISTANCE;
+            else
+              last_pose_.x -= QRDISTANCE;
+
+            pose_.x = last_pose_.x + qr_float_.x;
+            pose_.y = last_pose_.y + qr_float_.y;
+            pose_.theta = qr_float_.angle;
+          }*/
+          else
+          {
+            //update the pose.
+            pose_.x = pose_.x + dx * cos(pose_.theta + dtheta/2.0) - dy * sin(pose_.theta + dtheta/2.0);
+            pose_.y = pose_.y + dx * sin(pose_.theta + dtheta/2.0) + dy * cos(pose_.theta + dtheta/2.0);
+            pose_.theta = pose_.theta + dtheta;
+  //          std::cout << "QR odom1"<<std::endl;
+          }
+        }
+        else if(fabs(vy) > fabs(vx))
+        {
+          if((vy > 0) && (dist_y > 0.15))
+          {
+        //    last_pose_.x = qr_float_.y;
+            last_pose_.y += QRDISTANCE;
+            pose_.x = last_pose_.x + qr_float_.x;
+            pose_.y = last_pose_.y + qr_float_.y;
+            pose_.theta = qr_float_.angle;
+            std::cout << "odom update"<<std::endl;
+          }
+          else if((vy < 0) && (dist_y > 0.15))
+          {
+         //   last_pose_.x = qr_float_.y;
+            last_pose_.y -= QRDISTANCE;
+            pose_.x = last_pose_.x + qr_float_.x;
+            pose_.y = last_pose_.y + qr_float_.y;
+            pose_.theta = qr_float_.angle;
+
+          }
+          else
+          {
+            //update the pose.
+            pose_.x = pose_.x + dx * cos(pose_.theta + dtheta/2.0) - dy * sin(pose_.theta + dtheta/2.0);
+            pose_.y = pose_.y + dx * sin(pose_.theta + dtheta/2.0) + dy * cos(pose_.theta + dtheta/2.0);
+            pose_.theta = pose_.theta + dtheta;
+          }
+/*          if(fabs(dist_y) > (QRDISTANCE/2.0))
+          {
+            if(vy > 0)
+              last_pose_.y += QRDISTANCE;
+            else
+              last_pose_.y -= QRDISTANCE;
+
+            pose_.x = last_pose_.x + qr_float_.x;
+            pose_.y = last_pose_.y + qr_float_.y;
+            pose_.theta = qr_float_.angle;
+          }*/
+
+        }
+        else
+        {
+          if(qr_float_.num == 1)
+          {
+            pose_.x = qr_float_.x;
+            pose_.y = qr_float_.y;
+            pose_.theta = qr_float_.angle;
+          }
+        }
+      }
+      else      //正常的里程计。
+      {
+        //update the pose.
+normal_odom:
+        pose_.x = pose_.x + dx * cos(pose_.theta + dtheta/2.0) - dy * sin(pose_.theta + dtheta/2.0);
+        pose_.y = pose_.y + dx * sin(pose_.theta + dtheta/2.0) + dy * cos(pose_.theta + dtheta/2.0);
+        pose_.theta = pose_.theta + dtheta;
+ //       std::cout <<"dt="<< dt << std::endl;
+      }
+      if(pose_.theta > M_PI)
+        pose_.theta = pose_.theta - 2*M_PI;
+      else if(pose_.theta < -M_PI)
+        pose_.theta = pose_.theta + 2*M_PI;
+      if(odom_reset_)   //添加一个service清零。
+      {
+        pose_.x = pose_.y = pose_.theta = 0.0;
+        std::cout << "Odometry is reseted successfully!" << std::endl;
+        nh_.setParam("odom_reset", false);
+      }
+
+//      ROS_INFO("THETA=%.3f", pose_.theta*(180/M_PI));     //输出里程计转过的角度，单位为度。
+      agvparking_msg::AgvOdom QR_odom_msg;
+      geometry_msgs::Quaternion quat = tf::createQuaternionMsgFromYaw(pose_.theta);
+
+      //publish the Transform odom->base_link.
+      odom_trans_.header.frame_id = "odom";
+      odom_trans_.child_frame_id = "base_footprint";
+      odom_trans_.header.stamp = current_time_;
+      odom_trans_.transform.translation.x = pose_.x;
+      odom_trans_.transform.translation.y = pose_.y;
+      odom_trans_.transform.translation.z = 0.0;
+      odom_trans_.transform.rotation = quat;
+
+      odom_broadcaster_.sendTransform(odom_trans_);
+      //QR header info.
+
+      //publish Odometry.
+      //pose.
+      odom_msg_.header.stamp = current_time_;
+      odom_msg_.header.frame_id = "odom";
+      odom_msg_.child_frame_id = "base_footprint";
+      odom_msg_.pose.pose.position.x = pose_.x;
+      odom_msg_.pose.pose.position.y = pose_.y;
+      odom_msg_.pose.pose.position.z = 0.0;
+      odom_msg_.pose.pose.orientation = quat;
+      odom_msg_.pose.covariance[0] = 0.00001;
+      odom_msg_.pose.covariance[7] = 0.00001;
+      odom_msg_.pose.covariance[14] = 1000000000000.0;
+      odom_msg_.pose.covariance[21] = 1000000000000.0;
+      odom_msg_.pose.covariance[28] = 1000000000000.0;
+      odom_msg_.pose.covariance[35] = 0.001;
+
+      //velocity.
+      odom_msg_.twist.twist.linear.x = vx;
+      odom_msg_.twist.twist.linear.y = vy;
+      odom_msg_.twist.twist.angular.z = vw;
+
+      //QR odom.
+        //pose
+      QR_odom_msg.pose.position.x = odom_msg_.pose.pose.position.x;
+      QR_odom_msg.pose.position.y = odom_msg_.pose.pose.position.y;
+      QR_odom_msg.pose.position.z = 0.0;
+      QR_odom_msg.pose.orientation = odom_msg_.pose.pose.orientation;
+        //velocity
+      QR_odom_msg.twist.linear.x = odom_msg_.twist.twist.linear.x;
+      QR_odom_msg.twist.linear.y = odom_msg_.twist.twist.linear.y;
+      QR_odom_msg.twist.angular.z = odom_msg_.twist.twist.angular.z;
+        //QR info
+      QR_odom_msg.qr.Tagnum = QR_info_.num;
+      QR_odom_msg.qr.x = QR_info_.x;    //mm
+      QR_odom_msg.qr.y = QR_info_.y;    //mm
+      QR_odom_msg.qr.angle = angleMapAndRad(QR_info_.angle);  //rad.
+//      std::cout << "Tag_num=" << QR_odom_msg.qr.Tagnum << std::endl;
+      //publish.
+      odom_pub_.publish(odom_msg_);
+      QR_odom_pub_.publish(QR_odom_msg);      //发布二维码数据。
+      waitMilli(50);
+      last_time_ = current_time_;     //update last time.
+    }
+  }
+
+}
+void ServerSocket::alignInit()
+{
+  while(true)
+  {
+    nh_.param("align_first", this->align_first_, true); //自动调整。
+    QRfloat qr_data;
+
+    bool x_aligning = false, y_aligning = false, yaw_aligning = false;
+    if(feedbackVel_mutex_.try_lock())
+    {
+      qr_data = qr_float_;
+//      std::cout << "error_x=" << qr_data.x << std::endl;
+//      std::cout << "error_y=" << qr_data.y << std::endl;
+//      std::cout << "error_yaw=" << qr_data.angle << std::endl;
+      feedbackVel_mutex_.unlock();
+      if(!qr_data.num)
+        continue;
+/*      if((fabs(qr_data.x) >= POSITION_TOLERANCE) ||
+          (fabs(qr_data.y) >= POSITION_TOLERANCE) ||
+          (fabs(qr_data.angle) >= ANGLE_TOLERANCE))
+      {
+        if(fabs(qr_data.x) >= POSITION_TOLERANCE)
+          x_aligning = true;
+        else
+          x_aligning = false;
+        if(fabs(qr_data.y) >= POSITION_TOLERANCE)
+          y_aligning = true;
+        else
+          y_aligning = false;
+        if(fabs(qr_data.angle) >= ANGLE_TOLERANCE)
+          yaw_aligning = true;
+        else
+          yaw_aligning = false;
+      }*/
+
+
+      if((fabs(qr_data.x) < POSITION_TOLERANCE) && (fabs(qr_data.y) < POSITION_TOLERANCE) && fabs(qr_data.angle) < ANGLE_TOLERANCE)
+      {
+        x_aligning = false;
+        y_aligning = false;
+        yaw_aligning = false;
+        if(cmdVel_mutex_.try_lock())//调整完成，停止。
+        {
+            vel4f_[0] = 0.0;
+            vel4f_[1] = 0.0;
+            vel4f_[2] = 0.0;
+            vel4f_[3] = 0.0;
+            cmdVel_mutex_.unlock();
+         }
+        aligned_ = true;
+
+        align_ptr_->interrupt();        //关闭该线程。
+      }
+      else
+      {
+        if(fabs(qr_data.x) >= POSITION_TOLERANCE)
+          x_aligning = true;
+        else
+          x_aligning = false;
+        if(fabs(qr_data.y) >= POSITION_TOLERANCE)
+          y_aligning = true;
+        else
+          y_aligning = false;
+        if(fabs(qr_data.angle) >= ANGLE_TOLERANCE)
+          yaw_aligning = true;
+        else
+          yaw_aligning = false;
+      }
+
+      if(align_first_ && (x_aligning || y_aligning || yaw_aligning))
+      {
+        float vx = 0.0, vy = 0.0, vw = 0.0;
+        if(x_aligning)
+          vx = -SIGN(qr_data.x) * ALIGN_VEL;
+        if(y_aligning)
+          vy = -SIGN(qr_data.y) * ALIGN_VEL;
+        if(yaw_aligning)
+          vw = -SIGN(qr_data.angle) * ALIGN_VEL;
+
+        if(cmdVel_mutex_.try_lock())    //给定调整速度。
+        {
+          vel4f_[0] = vx;
+          vel4f_[1] = vy;
+          vel4f_[2] = vw;
+          vel4f_[3] = 0.0;
+          cmdVel_mutex_.unlock();
+        }
+      }
+/*      else if(align_first_ && !x_aligning && !y_aligning && !yaw_aligning)
+      {
+        aligned_ = true;
+        align_ptr_->interrupt();        //关闭该线程。
+      }*/
+
+    }
+    waitMilli(50);
+  }
+  //publish.
+}
+
+float ServerSocket::angleMapAndRad(const unsigned short int &angle)
+{
+//  printf("angle=%d\n", angle);
+  short int angle_mapped = 0;  //[-180, 180]
+  if(angle >= 180)
+    angle_mapped = 360 - angle;
+  else
+    angle_mapped = -angle;
+  //degree to radian.
+  float angle_rad = (float)angle_mapped * (M_PI/180.0);
+ // printf("angle_rad=%.3f\n",angle_rad);
+  return angle_rad;
+}
+
+float ServerSocket::computePoseDist(const Pose &pose1, const Pose &pose2)
+{
+  return hypot(pose1.x-pose2.x, pose1.y - pose2.y);
+}
+float ServerSocket::computeDist(const float &k1, const float &k2)
+{
+  return fabs(k1 - k2);
+}
+void waitMilli(int milliseconds)
+{
+  boost::this_thread::sleep_for(boost::chrono::milliseconds(milliseconds));
+}
+

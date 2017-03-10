@@ -1,0 +1,53 @@
+/*
+ * pose_align.cpp
+ *
+ *  Created on: Jan 6, 2017
+ *      Author: paul
+ */
+#include "ros/ros.h"
+#include "nav_msgs/Odometry.h"
+#include <geometry_msgs/Twist.h>
+#include "agvParking_msg/QRInfo.h"
+class PoseAlign
+{
+public:
+  PoseAlign();
+  ~PoseAlign();
+
+  struct PoseError
+  {
+    int x;
+    short int y;
+    float angle;
+  }error_;
+private:
+  void odomCallback(const nav_msgs::Odometry::ConstPtr &odom_ptr);
+  void qrInfoCallback(const agvParking_msg::QRInfo &qr_info);
+private:
+  //ros variable.
+  ros::NodeHandle nh_;
+  ros::Subscriber odom_sub_, QR_sub_;
+  ros::Publisher cmd_vel_pub_;
+
+  //varibles.
+  unsigned short int QR_num_;
+};
+
+PoseAlign::PoseAlign():nh_(ros::NodeHandle("~")),QR_num_(0)
+{
+  odom_sub_ = nh_.subscribe<nav_msgs::Odometry>("/odom", 100, &PoseAlign::odomCallback, this);
+  QR_sub_ = nh_.subscribe<agvParking_msg::QRInfo>("/tcp_driver/qr_info", 10, &PoseAlign::qrInfoCallback, this);
+}
+
+PoseAlign::~PoseAlign()
+{
+
+}
+void PoseAlign::odomCallback(const nav_msgs::Odometry::ConstPtr &odom_ptr)
+{
+
+}
+void PoseAlign::qrInfoCallback(const agvParking_msg::QRInfo &qr_info)
+{
+
+}
