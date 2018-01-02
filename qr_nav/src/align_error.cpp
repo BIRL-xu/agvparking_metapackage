@@ -1,0 +1,632 @@
+/*
+ * error_align.cpp
+ *
+ *  Created on: Jan 12, 2017
+ *      Author: paul
+ */
+#include "qr_nav/error_align.h"
+
+PoseAlign::PoseAlign(const std::vector<Target>& goals):nh_(ros::NodeHandle("~")),aligning_(false),aligned_(false),x_aligning_(false),y_aligning_(false),yaw_aligning_(false),navigation_(false)
+,goback_(false)
+{
+  moving_ = false;
+  time_update_ = false;
+  traj_aligning_ = false;
+  goals_.clear();
+
+  InitErr_.x = 0.0;
+  InitErr_.y = 0.0;
+  InitErr_.yaw = 0.0;
+  direction_x_ = 0.0;
+  direction_y_ = 0.0;
+
+  cmd_vel_.linear.x = 0.0;
+  cmd_vel_.linear.y = 0.0;
+  cmd_vel_.angular.z = 0.0;
+  position_tolerance_ = 0.01;   //8mm.
+  angle_tolerance_ = 0.025;        //0.05rad=2.87°.
+
+  //goals Initialize
+  setGoals(goals);
+
+  nh_.param("navigation", navigation_);
+//  now_time_ = ros::Time::now();
+  cmd_vel_pub_ = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 5);    //"/cmd_vel"为全局名称，"cmd_vel"为局部名称，发布时自动加上节点名空间，如/qr_nav_node/cmd_vel
+  QR_odom_sub_ = nh_.subscribe<agvparking_msg::AgvOdom>("/qr_odom", 1, &PoseAlign::qrInfoCallback, this);
+
+  //boost thread.
+  boost::shared_ptr<boost::thread> error_ptr = boost::shared_ptr<boost::thread>(new boost::thread(boost::bind(&PoseAlign::getPoseError, this)));
+
+ // boost::shared_ptr<boost::thread> move_ptr = boost::shared_ptr<boost::thread>(new boost::thread(boost::bind(&PoseAlign::alignAndMove, this)));
+  boost::shared_ptr<boost::thread> move_ptr = boost::shared_ptr<boost::thread>(new boost::thread(boost::bind(&PoseAlign::move, this)));
+}
+
+PoseAlign::~PoseAlign()
+{
+
+}
+
+void PoseAlign::setGoals(const std::vector<Target>& goals)
+{
+  this->goals_.assign(goals.begin(), goals.end());
+  this->goals_num_ = goals_.size();
+}
+void PoseAlign::qrInfoCallback(const agvparking_msg::AgvOdom::ConstPtr &qr_info)
+{
+  boost::unique_lock<boost::shared_mutex> lock(odom_mutex_);
+  //odom pose
+  qr_odom_.odom.x = qr_info->pose.position.x;
+  qr_odom_.odom.y = qr_info->pose.position.y;
+  qr_odom_.odom.yaw =  tf::getYaw(qr_info->pose.orientation);  //里程计航向角。
+  //odom velocity.
+  qr_odom_.odom.vx = qr_info->twist.linear.x;
+  qr_odom_.odom.vy = qr_info->twist.linear.y;
+  qr_odom_.odom.vw = qr_info->twist.angular.z;
+
+  qr_odom_.pose.tag_num = (unsigned short int)qr_info->QRtag.Tagnum;
+  qr_odom_.pose.x = qr_info->QRtag.x;         //m.
+  qr_odom_.pose.y = qr_info->QRtag.y;         //m.
+  qr_odom_.pose.angle = qr_info->QRtag.angle;        //rad.
+//  std::cout << "error_x=" << qr_odom_.pose.x<< std::endl;
+//  std::cout << "error_y=" << qr_odom_.pose.y<< std::endl;
+//  std::cout << "error_angle=" << qr_odom_.pose.angle<< std::endl;
+//    std::cout << "tag_num=" << qr_pose_.tag_num << std::endl;
+  lock.unlock();
+  waitMilli(10);
+}
+
+void PoseAlign::getPoseError()
+{
+  while(true)
+  {
+
+    QROdom odom_ref;
+    {
+ //     boost::unique_lock<boost::mutex> lock(odom_ref_mutex_);
+
+
+      odom_ref = ref_;
+//      cond_.notify_all();
+//      cond_.wait(odom_ref_mutex_);
+    }
+    OdomData odom_data;
+    {
+      boost::shared_lock<boost::shared_mutex> lock(odom_mutex_);
+      qr_pose_ = qr_odom_.pose;
+      odom_data = qr_odom_.odom;        //赋值给新变量，以尽快释放占用的线程锁。
+    }
+    boost::unique_lock<boost::timed_mutex> error_lock(error_mutex_);
+    boost::unique_lock<boost::timed_mutex> state_lock(state_mutex_);
+    if(qr_pose_.tag_num)                //识别到二维码时，以二维码的数据作为调整依据。
+    {
+      if((fabs(qr_pose_.x) < position_tolerance_) && (fabs(qr_pose_.y) < position_tolerance_) && fabs(qr_pose_.angle) < angle_tolerance_)
+      {
+        aligning_ = false;
+        aligned_ = true;
+        x_aligning_ = false;
+        y_aligning_ = false;
+        yaw_aligning_ = false;
+
+        traj_aligning_ = false;
+        boost::timed_mutex *sta_ptr = state_lock.release();
+        sta_ptr->unlock();
+        //error.
+        err_.x = 0.0;
+        err_.y = 0.0;
+        err_.yaw = 0.0;
+
+        boost::timed_mutex *err_ptr = error_lock.release();
+        err_ptr->unlock();
+      }
+      else
+      {
+        aligned_ = false;
+        aligning_ = true;
+       if(fabs(qr_pose_.x) >= position_tolerance_)
+       {
+         x_aligning_ = true;
+         err_.x = qr_pose_.x;
+       }
+       else
+       {
+         err_.x = 0.0;
+         x_aligning_ = false;
+       }
+       if(fabs(qr_pose_.y) >= position_tolerance_)
+       {
+         err_.y = qr_pose_.y;
+         y_aligning_ = true;
+       }
+       else
+       {
+         err_.y = 0.0;
+         y_aligning_ = false;
+       }
+       if(fabs(qr_pose_.angle) >= angle_tolerance_)
+       {
+         err_.yaw = qr_pose_.angle;
+         yaw_aligning_ = true;
+       }
+       else
+       {
+         err_.yaw = 0.0;
+         yaw_aligning_ = false;
+       }
+       boost::timed_mutex *sta_ptr = state_lock.release();
+       sta_ptr->unlock();
+
+       boost::timed_mutex *err_ptr = error_lock.release();
+       err_ptr->unlock();
+
+      }
+    }
+    else                      //没有识别到二维码时，以里程计的数据作为调整依据。所以，必须校正里程计以保证准确性。
+    {
+      if((motion_state_.dir == 'Y'))
+      {
+        err_.x = odom_data.x - odom_ref.odom.x;
+        err_.y = 0.0;
+        err_.yaw = odom_data.yaw;
+        boost::timed_mutex *err_ptr = error_lock.release();
+        err_ptr->unlock();
+
+        y_aligning_ = false;
+        if(fabs(fabs(odom_data.x)-fabs(odom_ref.odom.x)) >= TRAVEL_ERROR)
+          x_aligning_ = true;
+        else
+          x_aligning_ = false;
+
+        if(fabs(odom_data.yaw) >= angle_tolerance_)
+          yaw_aligning_ = true;
+        else
+          yaw_aligning_ = false;
+
+        if(x_aligning_ || y_aligning_ || yaw_aligning_)
+        {
+          aligning_ = true;
+          aligned_ = false;
+        }
+        else if(!x_aligning_ && !y_aligning_ && !yaw_aligning_)
+        {
+          aligning_ = false;
+          aligned_ = true;
+          traj_aligning_ = false;
+        }
+        boost::timed_mutex *sta_ptr = state_lock.release();
+        sta_ptr->unlock();
+      }
+      else if((motion_state_.dir == 'X'))
+      {
+        err_.x = 0.0;
+        err_.y = odom_data.y - odom_ref.odom.y;
+        err_.yaw = odom_data.yaw;
+/*
+        printf("odom_y = %.3f\n", odom_data.y);
+        printf("odom_ref = %.3f\n", odom_ref);
+        printf("err_y = %.3f\n", err_.y);
+        printf("err_yaw = %.3f\n", err_.yaw);
+*/
+        boost::timed_mutex *err_ptr = error_lock.release();
+        err_ptr->unlock();
+
+        x_aligning_ = false;
+        if(fabs(fabs(odom_data.y)-fabs(odom_ref.odom.y)) >= TRAVEL_ERROR)
+          y_aligning_ = true;
+        else
+          y_aligning_ = false;
+        if(fabs(odom_data.yaw) >= angle_tolerance_)
+          yaw_aligning_ = true;
+        else
+          yaw_aligning_ = false;
+
+        if(x_aligning_ || y_aligning_ || yaw_aligning_)
+        {
+          aligning_ = true;
+          aligned_ = false;
+        }
+        else if(!x_aligning_ && !y_aligning_ && !yaw_aligning_)
+        {
+          aligning_ = false;
+          aligned_ = true;
+          traj_aligning_ = false;
+        }
+        boost::timed_mutex *sta_ptr = state_lock.release();
+        sta_ptr->unlock();
+      }
+      else
+      {
+        aligning_ = false;
+        x_aligning_ = false;
+        y_aligning_ = false;
+        yaw_aligning_ = false;
+        aligned_ = true;
+        traj_aligning_ = false;
+        boost::timed_mutex *sta_ptr = state_lock.release();
+        sta_ptr->unlock();
+
+        err_.x = 0.0;
+        err_.y = 0.0;
+        err_.yaw = 0.0;
+        boost::timed_mutex *err_ptr = error_lock.release();
+        err_ptr->unlock();
+      }
+    }
+
+    printf("odom = (%.3f, %.3f)\n", odom_data.x, odom_data.y);
+    printf("odom_ref = (%.3f, %.3f)\n", odom_ref.odom.x, odom_ref.odom.y);
+    printf("error======(%.3f, %.3f, %.3f)\n",err_.x, err_.y, err_.yaw);
+
+    waitMilli(10);
+  }
+}
+
+void PoseAlign::move()
+{
+  while(true)
+  {
+    static short int counter = 0;
+    nh_.param("navigation", this->navigation_, false);
+    if(!navigation_)
+      continue;
+
+    //============= copy data ====================//
+    QROdom odom;
+    {
+      boost::shared_lock<boost::shared_mutex> lock(odom_mutex_);
+      odom = qr_odom_;
+    }
+    Error error;
+    bool aligning, x_aligning, y_aligning, yaw_aligning, aligned;
+    {
+      boost::unique_lock<boost::timed_mutex> err_lock(error_mutex_, boost::try_to_lock);
+      if(err_lock.owns_lock() || err_lock.try_lock_for(boost::chrono::milliseconds(10)))
+      {
+        error = err_;
+        err_lock.unlock();
+      }
+      boost::unique_lock<boost::timed_mutex> state_lock(state_mutex_, boost::try_to_lock);
+      if(state_lock.owns_lock() || state_lock.try_lock_for(boost::chrono::milliseconds(10)))
+      {
+        aligning = aligning_;
+        x_aligning = x_aligning_;
+        y_aligning = y_aligning_;
+        yaw_aligning = yaw_aligning_;
+        aligned = aligned_;
+        state_lock.unlock();
+      }
+/*
+      printf("aligning=%s\n", aligning==false?"False":"True");
+      printf("aligned=%s\n", aligned==false?"False":"True");
+      printf("x_aligning=%s\n", x_aligning==false?"False":"True");
+      printf("y_aligning=%s\n", y_aligning==false?"False":"True");
+      printf("yaw_aligning=%s\n", yaw_aligning==false?"False":"True");
+*/
+    }
+    //moving.
+    static double goal_x = 0.0;
+    static double goal_y = 0.0;
+
+    if(!moving_)
+    {
+      ROS_WARN_ONCE("Stop State.");
+      if((odom.pose.tag_num == 1) || (odom.pose.tag_num == 3) || (odom.pose.tag_num == 5))
+      {
+
+        if(odom.pose.tag_num == 5)
+          goback_ = true;
+        else if(odom.pose.tag_num == 1)
+          goback_ = false;
+
+        if(aligning)
+        {
+          alignInit(error, cmd_vel_);
+//          cmd_vel_pub_.publish(cmd_vel_);
+//          continue;
+        }
+        else
+        {
+          cmd_vel_.linear.x = 0.0;
+          cmd_vel_.linear.y = 0.0;
+
+          cmd_vel_.angular.x = 0.0;
+          cmd_vel_.angular.y = 0.0;
+          cmd_vel_.angular.z = 0.0;
+          //lift or down.
+          if((odom.pose.tag_num == 1) || (odom.pose.tag_num == 5))
+          {
+            static ros::WallTime lift_time = ros::WallTime::now();    //计时起始处需要设定。
+           if(time_update_)
+           {
+             lift_time = ros::WallTime::now();
+             time_update_ = false;
+           }
+           last_time_ = ros::WallTime::now();
+           const unsigned int dt = ((last_time_.sec*1000 + last_time_.nsec/1000000) - (lift_time.sec*1000 + lift_time.nsec/1000000));
+       //    printf("dt = %d\n", dt);
+            if(dt <= 5000)
+            {
+              if(motion_state_.lift)
+                cmd_vel_.linear.z = -1.0;
+              else
+                cmd_vel_.linear.z = 1.0;
+              ROS_WARN_ONCE("lift or down.");
+              cmd_vel_pub_.publish(cmd_vel_);
+              continue;
+            }
+            else
+            {
+              cmd_vel_.linear.z = 0.0;
+              motion_state_.lift = motion_state_.lift?false : true;
+            }
+          }
+
+          //update ref_
+          ref_ = odom;  //使用调整结束后的值作为参考值。
+          //四舍五入
+/*          int QRdist_x = 0, QRdist_y = 0;           //QRDISTANCE
+          if(odom.odom.x >= 0)
+          {
+            QRdist_x = (int)((odom.odom.x/QRDISTANCE*10 + 5)/10.0);
+          }
+          else
+            QRdist_x = (int)((odom.odom.x/QRDISTANCE*10 - 5)/10.0);
+          if(odom.odom.y >= 0)
+          {
+            QRdist_y = (int)((odom.odom.y/QRDISTANCE*10 + 5)/10.0);
+          }
+          else
+            QRdist_y = (int)((odom.odom.y/QRDISTANCE*10 - 5)/10.0);
+
+          ref_.odom.x =  (float)QRdist_x * QRDISTANCE;
+          ref_.odom.y =  (float)QRdist_y * QRDISTANCE;
+          ref_.odom.yaw = odom.pose.angle;*/
+
+          //更新目标点。
+/*          if(goback_ && counter >= 1)
+            counter--;
+          else if(!goback_)
+            counter++;
+*/
+           counter++;
+           if(counter == goals_num_)
+             counter = 0;
+
+          goal_x = goals_[counter].x;
+          goal_y = goals_[counter].y;
+//          printf("Goal %d: (%.3f, %.3f)\n",counter, goal_x, goal_y);
+          direction_x_ = goal_x - odom.odom.x;  //计算当前位置到下一个目标点的距离,用于判断机器人的行驶方向.
+          direction_y_ = goal_y - odom.odom.y;
+          time_update_ = true;
+          moving_ = true;       //进入运动状态。
+
+          //回到起点时,自动重置里程计.
+          if(odom.pose.tag_num == 1)
+          {
+            if(nh_.hasParam("/tcp_driver_node/odom_reset"))
+            {
+              nh_.setParam("/tcp_driver_node/odom_reset", true);
+            }
+            else
+              ROS_ERROR("odom_reset is not exist in PARAMETER SERVER!");
+          }
+        }
+      }
+      else
+      {
+//        std::cout << "Wrong Stop!!!!" << std::endl;
+        ROS_ERROR("Wrong Stop!!!!");
+        alignInit(error, cmd_vel_);
+      }
+    }
+    else        //moving state.
+    {
+      ROS_WARN_ONCE("Moving State.");
+      geometry_msgs::Twist align_vel;
+      double temp_x = 0.0;
+      double temp_y = 0.0;
+      temp_x = goal_x - odom.odom.x;
+      temp_y = goal_y - odom.odom.y;
+      //到下一个目标点的距离。
+      const float Dist2Goal = sqrt(temp_x*temp_x + temp_y*temp_y);
+      //agv行驶过的距离。
+      const float TravelDist = sqrt((odom.odom.x-ref_.odom.x)*(odom.odom.x-ref_.odom.x) + (odom.odom.y-ref_.odom.y)*(odom.odom.y-ref_.odom.y));
+/*      printf("goal_x = %.3f\n", goal_x);
+      printf("goal_y = %.3f\n", goal_y);
+      printf("odom_x = %.3f\n", odom.odom.x);
+      printf("odom_y = %.3f\n", odom.odom.x);
+      printf("temp_x = %.3f\n", temp_x);
+      printf("temp_y = %.3f\n", temp_y);*/
+  //    printf("Dist2Goal = %.3f\n", Dist2Goal);
+
+      if((Dist2Goal < QRDISTANCE/2) && ((odom.pose.tag_num == 1) || (odom.pose.tag_num == 3) || (odom.pose.tag_num == 5)))
+      {
+        moving_ = false;        //进入stop状态。
+      }
+      else if((TravelDist <= (QRDISTANCE-0.1) ) || (Dist2Goal < (QRDISTANCE+0.15)) )   //两段慢速端。
+      {
+        if(aligning)
+        {
+          ROS_WARN("Arc aligning.");
+          trajAlign(error, InitErr_, align_vel);
+        }
+
+        if(fabs(direction_x_) > fabs(direction_y_))
+        {
+   //       ROS_WARN("Low speed : X.");
+          motion_state_.dir = 'X';
+          cmd_vel_.linear.x = SIGN(direction_x_)*START_VEL;
+          cmd_vel_.linear.y = align_vel.linear.y;
+        }
+        else if(fabs(direction_x_) < fabs(direction_y_))    //moving on Y.
+        {
+    //      ROS_WARN("Low speed : Y.");
+          motion_state_.dir = 'Y';
+          cmd_vel_.linear.x = align_vel.linear.x;
+          cmd_vel_.linear.y = SIGN(direction_y_)*START_VEL;
+        }
+      }
+      else      //高速行驶阶段。
+      {
+        if(aligning)
+        {
+          ROS_WARN("Arc aligning.");
+          trajAlign(error, InitErr_, align_vel);
+        }
+        if(fabs(direction_x_) > fabs(direction_y_)) //moving on X.
+        {
+  //        ROS_WARN("High speed : X.");
+          cmd_vel_.linear.x = SIGN(direction_x_)*TRAVEL_VEL_X;
+          cmd_vel_.linear.y = align_vel.linear.y;
+        }
+        else if(fabs(direction_x_) < fabs(direction_y_))    //moving on Y.
+        {
+ //         ROS_WARN("High speed : Y.");
+          cmd_vel_.linear.x = align_vel.linear.x;
+          cmd_vel_.linear.y = SIGN(direction_y_)*TRAVEL_VEL_Y;
+        }
+      }
+    }
+    //publish.
+     cmd_vel_pub_.publish(cmd_vel_);
+
+     last_cmd_ = cmd_vel_;
+     waitMilli(10);
+  }
+}
+float PoseAlign::angleMapAndRad(const float &angle)
+{
+  unsigned short int angle_mapped = 0;  //[-180, 180]
+  if(angle >= 180)
+    angle_mapped = angle - 360;
+  else
+    angle_mapped = -angle;
+  //degree to radian.
+  float angle_rad = (float)angle_mapped * (M_PI/180.0);
+  return angle_rad;
+}
+
+void PoseAlign::stop()
+{
+  cmd_vel_.linear.x = 0.0;
+  cmd_vel_.linear.y = 0.0;
+  cmd_vel_.linear.z = 0.0;
+  cmd_vel_.angular.z = 0.0;
+  //publish
+  cmd_vel_pub_.publish(cmd_vel_);
+  waitMilli(100);
+}
+
+void PoseAlign::alignInit(const Error &error, geometry_msgs::Twist &cmd_vel)
+{
+  float vx = 0.0, vy = 0.0, vw = 0.0;
+  if(x_aligning_)
+    vx = -SIGN(error.x) * ALIGN_VEL;
+  if(y_aligning_)
+    vy = -SIGN(error.y) * ALIGN_VEL;
+  if(yaw_aligning_)
+    vw = -SIGN(error.yaw) * ALIGN_VEL*5;
+  cmd_vel.linear.x = vx;
+  cmd_vel.linear.y = vy;
+  cmd_vel.linear.z = 0.0;
+  cmd_vel.angular.z = vw;
+}
+//轨迹修正算法实现。
+
+void PoseAlign::trajAlign(const Error &error, const Error &init_error, geometry_msgs::Twist &vel)
+{
+  const float VelAlign_x = 0.025;//最大调整速度。
+  const float VelAlign_y = 0.05;
+  if(motion_state_.dir == 'X')
+  {
+    const float VelTravel = last_cmd_.linear.x;
+    float vy = 0.0;
+    if(y_aligning_)
+    {
+      if(!traj_aligning_)
+      {
+        InitErr_.x = error.x;
+        InitErr_.y = error.y;
+        InitErr_.yaw = error.yaw;
+ //     printf("error======(%.3f, %.3f, %.3f)\n",error.x, error.y, error.yaw);
+        traj_aligning_ = true;
+      }
+//      printf("error======(%.3f, %.3f, %.3f)\n",error.x, error.y, error.yaw);
+      const float InitTheta = fabs(atan(VelAlign_x/VelTravel));     //rad.
+      const float k = (1-cos(InitTheta))/fabs(init_error.y);
+      float a = 1-k*fabs(error.y);
+      a = fabs(a)>1?SIGN(a):a;
+      float theta = fabs(acos(a));
+      theta = (theta > InitTheta)?InitTheta:theta;
+      vy = -1*SIGN(error.y)*fabs(VelTravel)*tan(theta);
+
+/*
+      printf("InitTheta =%.3f\n", InitTheta);
+      printf("error_y =$$$$$$$$$$$%.3f\n", error.y);
+      printf("init_error_y =%.3f\n", init_error.y);
+      printf("k =%.3f\n", k);
+      printf("theta =%.3f\n", theta);
+      printf("vy =%.3f\n", vy);
+*/
+    }
+    else
+      vy = 0.0;
+    //cmd_vel
+    vel.linear.x = VelTravel;
+    vel.linear.y = vy;
+    vel.linear.z = 0.0;
+    vel.angular.x = 0.0;
+    vel.angular.y = 0.0;
+  }
+  else if(motion_state_.dir == 'Y')
+  {
+    const float VelTravel = last_cmd_.linear.y;
+    float vx = 0.0;
+    if(x_aligning_)
+    {
+      if(!traj_aligning_)
+      {
+        InitErr_.x = error.x;
+        InitErr_.y = error.y;
+        InitErr_.yaw = error.yaw;
+ //       printf("error=(%.3f, %.3f, %.3f)\n",error.x, error.y, error.yaw);
+        traj_aligning_ = true;
+      }
+      const float VelTravel = last_cmd_.linear.y;
+      const float InitTheta = fabs(atan(VelAlign_x/VelTravel));     //rad.
+      const float k = (1-cos(InitTheta))/fabs(init_error.x);
+      float a = 1-k*fabs(error.x);
+      a = fabs(a)>1?SIGN(a):a;
+      float theta = fabs(acos(a));
+      theta = (theta > InitTheta)?InitTheta:theta;
+      vx = -1*SIGN(error.x)*fabs(VelTravel)*tan(theta);
+/*
+      printf("InitTheta =%.3f\n", InitTheta);
+      printf("error_x =%.3f\n", error.x);
+      printf("init_error_x =%.3f\n", init_error.x);
+      printf("k =%.3f\n", k);
+      printf("theta =%.3f\n", theta);
+      printf("vx =%.3f\n", vx);
+ */
+    }
+    else
+      vx = 0.0;
+    //cmd_vel
+    vel.linear.x = vx;
+    vel.linear.y = VelTravel;
+    vel.linear.z = 0.0;
+    vel.angular.x = 0.0;
+    vel.angular.y = 0.0;
+  }
+  else
+  {
+    vel = last_cmd_;
+  }
+
+
+  if(yaw_aligning_)
+    vel.angular.z = -SIGN(error.yaw) * 0.01;
+  else
+    vel.angular.z = 0.0;
+}
+
+

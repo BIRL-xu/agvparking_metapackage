@@ -1,0 +1,7 @@
+<launch>
+
+  <node pkg="pose_ekf" name="pose_ekf_node" type="pose_ekf_node" output="screen">
+    <param name="debug" value="true"/>
+  </node>
+
+</launch>
