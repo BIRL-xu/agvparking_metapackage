@@ -14,9 +14,9 @@
 #include <geometry_msgs/Twist.h>
 #include <tf/transform_broadcaster.h>
 #include "nav_msgs/Odometry.h"
+#include <queue>
 
-
-#define SIGN(x) ((x > 0) - (x < 0))
+#define SIGN(x) ((x > 0) - (x < 0))     //取符号函数.
 
 //tolerance
 #define POSITION_TOLERANCE 0.005        //m.
@@ -42,8 +42,37 @@ private:
   inline void dataHandle();
   inline void readDataHandle();
   void odom();
-  void alignInit();
+  void rawOdom();
+
   float angleMapAndRad(const unsigned short int &angle);
+  typedef struct IntCMDVEL
+  {
+    short int vx;
+    short int vy;
+    short int vw;
+    short int vz;
+/*    IntCMDVEL &operator=(const IntCMDVEL &cpy)        //该重载操作符右编译器自动实现.
+    {
+      if(this != &cpy)
+      {
+        this->vx = cpy.vx;
+        this->vy = cpy.vy;
+        this->vw = cpy.vw;
+        this->vz = cpy.vz;
+      }
+      return *this;
+    }*/
+    IntCMDVEL()
+    {
+      vx = 0;
+      vy = 0;
+      vw = 0;
+      vz = 0;
+    }
+  }IntCmdVel;
+  IntCmdVel optimMoveAverageFilter(const IntCmdVel& cmd_vel);
+
+private:
   union DataExchange
   {
     short int int_num;
@@ -78,21 +107,25 @@ private:
     }
   }QR_info_;
 
-  struct QRfloat
+  struct FeedbackData
   {
     float x;    //m.
     float y;    //m.
     float angle;        //rad.
+    float vel[3];       //feedback_vel.
     unsigned short int num;
-    QRfloat()
+    FeedbackData()
     {
       x = 0.0;
       y = 0.0;
       angle = 0.0;
       num = 0;
+      vel[0] = 0.0;
+      vel[1] = 0.0;
+      vel[2] = 0.0;
     }
 
-  }qr_float_;
+  }recv_data_;
 
   //计算距离
   float computePoseDist(const Pose &pose1, const Pose &pose2);
@@ -114,9 +147,11 @@ private:
   bool tcp_alive_;     //监听状态。
   bool getQR_;
   float vel4f_[4];
-  float vel_feedback_[3];
   Byte sample_buff_[4];
   Byte read_buff_[18];
+  std::queue<IntCmdVel> cmd_buffer_;         //滑动均值滤波的缓存器.
+  IntCmdVel last_cmd_;
+  const short int cmd_buf_size_;
   //odom scale.
   double odom_scale_x_;
   double odom_scale_y_;

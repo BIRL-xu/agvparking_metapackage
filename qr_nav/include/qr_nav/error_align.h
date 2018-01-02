@@ -10,17 +10,20 @@
 #include <boost/thread/thread.hpp>
 #include <boost/shared_ptr.hpp>
 #include "ros/ros.h"
+#include "ros/timer.h"
 #include "nav_msgs/Odometry.h"
 #include <geometry_msgs/Twist.h>
 #include "nav_msgs/Odometry.h"
-#include "agvparking_msg/AgvOdom.h"
 #include <tf/transform_broadcaster.h>
-#include "ros/timer.h"
+
+#include "agvparking_msg/AgvOdom.h"
+#include <vector>
+
 
 #define SIGN(x) ((x > 0) - (x < 0))
 #define ALIGN_VEL       0.01
 #define START_VEL       0.1
-#define TRAVEL_VEL_X    0.4
+#define TRAVEL_VEL_X    0.35
 #define TRAVEL_VEL_Y    0.3
 #define OMEGA           0.15
 
@@ -42,7 +45,7 @@ class PoseAlign
 {
 public:
 
-  PoseAlign(const Target goal[], long unsigned int size);
+  PoseAlign(const std::vector<Target>& goals);
   ~PoseAlign();
 private:
   struct QRPose
@@ -88,17 +91,11 @@ private:
   }qr_odom_;
   struct MotionState
   {
-    std::string moving_dir;     //"":no; "X+";"X-";"Y+";"Y-".
-    std::string expeted_dir;   //"":no; "X+";"X-";"Y+";"Y-".
-    char start;         //0：none;1：起点；2:终点。
-    char speedup;       //0：none;1:加速；-1:减速。
+    char dir;
     bool lift;
     MotionState()
     {
-      moving_dir = "";
-      expeted_dir = "";
-      start = 1;
-      speedup = 0;
+      dir = 'Y';
       lift = false;
     }
   }motion_state_;
@@ -116,24 +113,16 @@ private:
     }
   }err_;
 
-
-
-
   void qrInfoCallback(const agvparking_msg::AgvOdom::ConstPtr &qr_info);
   void getPoseError();
-  void alignAndMove();
   void move();
-  void alignAlgorithm(const QROdom &qr_odom, const Error &error, float &vx, float &vy, float &vw, unsigned short int &t);
   void stop();
   void alignInit(const Error &error, geometry_msgs::Twist &cmd_vel);
-  void trajAlign(const QROdom &qr_odom, const Error &error, geometry_msgs::Twist &vel, float dist);
   void trajAlign(const Error &error, const Error &init_error, geometry_msgs::Twist &vel);
   float angleMapAndRad(const float &angle);
-  void setState(const MotionState &state);
-  MotionState getState();
-  bool getCmdVel(const Target &goal, const QROdom &cur_pose, geometry_msgs::Twist& vel);
 
-  void setGoals(const Target goal[], const short int size);
+private:
+  void setGoals(const std::vector<Target>& goals);
 private:
 
   //ros variable.
@@ -144,11 +133,7 @@ private:
   ros::WallTime last_time_;             //世界时钟时间。
   ros::Time time_;
   //varibles.
-  float pose3f_[3];
-  float vel3f_[3];
-  float odom_ref_;      //作为里程计参考的数据。
   QROdom ref_;
-  float d_const_;
   bool aligning_, aligned_, x_aligning_, y_aligning_, yaw_aligning_, traj_aligning_;
   bool moving_;
   bool navigation_, goback_;
@@ -162,8 +147,12 @@ private:
 
  //error
   Error InitErr_;
-
-  Target *goal_;
   long unsigned int goals_num_;
+  std::vector<Target> goals_;
+
+  double direction_x_;
+  double direction_y_;
+
+
 };
 #endif /* INCLUDE_QR_NAV_ERROR_ALIGN_H_ */

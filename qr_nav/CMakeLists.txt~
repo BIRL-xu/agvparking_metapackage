@@ -120,7 +120,7 @@ include_directories(
 
 ## Declare a C++ library
 add_library(QRNavlib
-  src/pose_align.cpp
+  src/error_align.cpp
 )
 
 ## Add cmake target dependencies of the library
@@ -129,16 +129,16 @@ add_library(QRNavlib
 add_dependencies(${agvparking_msg_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 
 ## Declare a C++ executable
-# add_executable(qr_nav_node src/qr_nav_node.cpp)
+add_executable(qr_nav_node src/qr_nav.cpp)
 
 ## Add cmake target dependencies of the executable
 ## same as for the library above
 # add_dependencies(qr_nav_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 
 ## Specify libraries to link a library or executable target against
-# target_link_libraries(qr_nav_node
-#   ${catkin_LIBRARIES}
-# )
+target_link_libraries(qr_nav_node QRNavlib boost_chrono
+  ${catkin_LIBRARIES}
+)
 
 #############
 ## Install ##
@@ -187,3 +187,5 @@ add_dependencies(${agvparking_msg_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 
 ## Add folders to be run by python nosetests
 # catkin_add_nosetests(test)
+set(ROS_BUILD_TYPE Debug)
+set(CMAKE_BUILD_TYPE Debug)

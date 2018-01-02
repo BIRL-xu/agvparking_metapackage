@@ -7,16 +7,27 @@
 #include "tcp_driver/tcp_driver.h"
 #include "agvparking_msg/QRInfo.h"
 #include "agvparking_msg/AgvOdom.h"
+
+#include <ros/console.h>
+
 ServerSocket::ServerSocket(boost::asio::io_service &io_sev, const int port):
 server_socket_(io_sev),acceptor_(io_sev, tcp::endpoint(tcp::v4(), port)),tcp_alive_(false),getQR_(false),odom_reset_(false),align_first_(false),
-aligned_(false),limit_vx_(0.0),limit_vy_(0.0), limit_vw_(0.0),nh_(ros::NodeHandle("~"))
+aligned_(false),limit_vx_(0.0),limit_vy_(0.0), limit_vw_(0.0),nh_(ros::NodeHandle("~")), cmd_buf_size_(15)
 {
   memset(vel4f_, 0.0, 4);
-  memset(vel_feedback_, 0.0, 3);
+  memset(recv_data_.vel, 0.0, 3);
   memset(sample_buff_, 0, 4);
   memset(read_buff_, 0, 18);
   last_pose_.x = last_pose_.y = 0.0;
+  pose_.x = pose_.y = pose_.theta = 0.0;
   current_time_ = last_time_ = ros::Time::now();
+
+  //滑动均值滤波初始化.
+  IntCmdVel init_cmdvel;
+  for(int i = 0; i < cmd_buf_size_; i++)
+  {
+    cmd_buffer_.push(init_cmdvel);
+  }
 
   nh_.param("max_vx", limit_vx_, limit_vx_);
   nh_.param("max_vy", limit_vy_, limit_vy_);
@@ -38,8 +49,8 @@ aligned_(false),limit_vx_(0.0),limit_vy_(0.0), limit_vw_(0.0),nh_(ros::NodeHandl
   send_thrd_ptr_ = boost::shared_ptr<boost::thread>(new boost::thread(boost::bind(&ServerSocket::socketWrite, this )));
   read_thrd_ptr_ = boost::shared_ptr<boost::thread>(new boost::thread(boost::bind(&ServerSocket::socketRead, this )));
   read_handle_ptr_ = boost::shared_ptr<boost::thread>(new boost::thread(boost::bind(&ServerSocket::readDataHandle, this )));
-  odom_thrd_ = boost::shared_ptr<boost::thread>(new boost::thread(boost::bind(&ServerSocket::odom, this )));
-  align_ptr_ = boost::shared_ptr<boost::thread>(new boost::thread(boost::bind(&ServerSocket::alignInit, this)));
+ // odom_thrd_ = boost::shared_ptr<boost::thread>(new boost::thread(boost::bind(&ServerSocket::odom, this )));
+  odom_thrd_ = boost::shared_ptr<boost::thread>(new boost::thread(boost::bind(&ServerSocket::rawOdom, this )));
 }
 ServerSocket::~ServerSocket()
 {
@@ -52,17 +63,19 @@ void ServerSocket::listenOnPort()
 {
   while(true)
   {
+  //  printf("Listen.\n");
     boost::system::error_code error;
     waitMilli(10);
-//    std::cout << "error:" << error.message() << std::endl;
-    acceptor_.accept(server_socket_,error);
+  //  std::cout << "error1:" << error.message() << std::endl;
+    acceptor_.accept(server_socket_,error);     //　阻塞，直至连接成功．
+ //   std::cout << "error2:" << error.message() << std::endl;
     if(!error)          //连接成功。
-      tcp_alive_ = true;
-    else
     {
- //     std::cout << "error:" << error.message() << std::endl;
- //     tcp_alive_ = false;
+      tcp_alive_ = true;
+      printf("TCP Success.\n");
     }
+//    else
+  //    tcp_alive_ = false;
   }
 }
 void ServerSocket::socketWrite()
@@ -149,10 +162,17 @@ void ServerSocket::velCallback(const geometry_msgs::Twist::ConstPtr &msg_ptr)
 {
   if(cmdVel_mutex_.try_lock())
   {
+    //just for debug.
+/*   {
+      limit_vx_ = 1.5;
+      limit_vy_ = 1.5;
+      limit_vw_ = 1.5;
+    }*/
     vel4f_[0] = (fabs(msg_ptr->linear.x) > limit_vx_)?(SIGN(msg_ptr->linear.x)*limit_vx_) : msg_ptr->linear.x;       //vx
     vel4f_[1] = (fabs(msg_ptr->linear.y) > limit_vy_)?(SIGN(msg_ptr->linear.y)*limit_vy_) : msg_ptr->linear.y;       //vy
     vel4f_[2] = (fabs(msg_ptr->angular.z) > limit_vw_)?(SIGN(msg_ptr->angular.z)*limit_vw_) : msg_ptr->angular.z;;   //w
     vel4f_[3] = msg_ptr->linear.z;         //举升命令。
+
     cmdVel_mutex_.unlock();
   }
 }
@@ -161,10 +181,27 @@ void ServerSocket::dataHandle() //这个函数可以放到速度回调函数里�
 {
   if(cmdVel_mutex_.try_lock())
   {
-    dataEx[0].int_num = (short int)(vel4f_[0] * 100);  //将real放大100倍后取整，便于数据传送。
-    dataEx[1].int_num = (short int)(vel4f_[1] * 100);
-    dataEx[2].int_num = (short int)(vel4f_[2] * 100);
-    dataEx[3].int_num = (short int)(vel4f_[3] * 100);
+ //=========速度滑动均值滤波.buffer_size = 10.
+    IntCmdVel vel;
+    vel.vx = (short int)(vel4f_[0] * 100);
+    vel.vy = (short int)(vel4f_[1] * 100);
+    vel.vw = (short int)(vel4f_[2] * 100);
+    vel.vz = (short int)(vel4f_[3] * 100);
+
+    IntCmdVel opt_vel = optimMoveAverageFilter(vel);        //速度光滑处理.会不会把轨迹调整的速度滤掉?
+    dataEx[0].int_num = opt_vel.vx;
+    dataEx[1].int_num = opt_vel.vy;
+    dataEx[2].int_num = opt_vel.vw;
+    dataEx[3].int_num = opt_vel.vz;
+//========================================
+
+/*
+    dataEx[0].int_num = (short int)(vel4f_[0] * 100);  //将real放大100倍后取整，便于数据传送。vx
+    dataEx[1].int_num = (short int)(vel4f_[1] * 100);   //vy
+    dataEx[2].int_num = (short int)(vel4f_[2] * 100);   //vw
+    dataEx[3].int_num = (short int)(vel4f_[3] * 100);   //vz
+*/
+
 
     sample_buff_[0] = dataEx[0].data;
     sample_buff_[1] = dataEx[1].data;
@@ -259,13 +296,13 @@ void ServerSocket::readDataHandle()
 
       feedbackVel_mutex_.lock();
       //int转换为real.
-      vel_feedback_[0] = (float)vx_int / 1000.0;
-      vel_feedback_[1] = (float)vy_int / 1000.0;
-      vel_feedback_[2] = (float)w_int / 1000.0;
+      recv_data_.vel[0] = (float)vx_int / 1000.0;
+      recv_data_.vel[1] = (float)vy_int / 1000.0;
+      recv_data_.vel[2] = (float)w_int / 1000.0;
 
-      vel_feedback_[0] = (fabs(vel_feedback_[0])) < 0.001?0.0 : vel_feedback_[0];
-      vel_feedback_[1] = (fabs(vel_feedback_[1])) < 0.001?0.0 : vel_feedback_[1];
-      vel_feedback_[2] = (fabs(vel_feedback_[2])) < 0.001?0.0 : vel_feedback_[2];
+      recv_data_.vel[0] = (fabs(recv_data_.vel[0])) < 0.001?0.0 : recv_data_.vel[0];
+      recv_data_.vel[1] = (fabs(recv_data_.vel[1])) < 0.001?0.0 : recv_data_.vel[1];
+      recv_data_.vel[2] = (fabs(recv_data_.vel[2])) < 0.001?0.0 : recv_data_.vel[2];
 
       //QR
       QR_info_.x = (QR_x[2] << 16) | (QR_x[1] << 8) | QR_x[0] ;
@@ -277,23 +314,24 @@ void ServerSocket::readDataHandle()
       else
         getQR_ = false;
  //     printf("QR_info:(%d,%d,%d,%d)\n",QR_info_.x,QR_info_.y, QR_info_.angle,QR_info_.num);
-      qr_float_.x = QR_info_.x / 1000.0;        //m.
-      qr_float_.y = QR_info_.y / 1000.0;        //m.
-      qr_float_.angle = angleMapAndRad(QR_info_.angle); //rad.
-      qr_float_.num = QR_info_.num;
+//	printf("QR_num= (%d)\n",QR_info_.num);
+      recv_data_.x = QR_info_.x / 1000.0;        //m.
+      recv_data_.y = QR_info_.y / 1000.0;        //m.
+      recv_data_.angle = angleMapAndRad(QR_info_.angle); //rad.
+      recv_data_.num = QR_info_.num;
       //topic message.
-
-      feedbackVel_mutex_.unlock();
       //publish.
       geometry_msgs::Twist vel;
-      vel.linear.x = vel_feedback_[0];
-      vel.linear.y = vel_feedback_[1];
+      vel.linear.x = recv_data_.vel[0];
+      vel.linear.y = recv_data_.vel[1];
       vel.linear.z = 0.0;
       vel.angular.x = 0.0;
       vel.angular.y = 0.0;
-      vel.angular.z = vel_feedback_[2];
+      vel.angular.z = recv_data_.vel[2];
       vel_pub_.publish(vel);            //发布反馈速度；
-      read_mutex_.unlock();
+      feedbackVel_mutex_.unlock();
+ //     read_mutex_.unlock();
+
     }
   }
 }
@@ -311,11 +349,12 @@ void ServerSocket::odom()
     float vx = 0.0, vy = 0.0, vw = 0.0;
     if(feedbackVel_mutex_.try_lock())
     {
-      vx = vel_feedback_[0];
-      vy = vel_feedback_[1];
-      vw = vel_feedback_[2];
-      QRfloat qr_data = qr_float_;
+      FeedbackData recv_data = recv_data_;
       feedbackVel_mutex_.unlock();
+
+      vx = recv_data.vel[0];
+      vy = recv_data.vel[1];
+      vw = recv_data.vel[2];
       //calculate the displacement.
       const float dt = (current_time_ - last_time_).toSec();
       const float dx = vx * dt * odom_scale_x_;
@@ -327,42 +366,73 @@ void ServerSocket::odom()
 
       if(getQR_)
       {
+        //里程计更新模型2:odom_x = [odom_x/D]*D + QRtag.x.         //[odom_x/D]为四舍五入.
+ /*       {
+          //四舍五入
+          int pre_pose_x = 0, pre_pose_y = 0;
+          if(pose_.x >= 0)
+          {
+            pre_pose_x = (int)((pose_.x/QRDISTANCE*10 + 5)/10.0);
+          }
+          else
+            pre_pose_x = (int)((pose_.x/QRDISTANCE*10 - 5)/10.0);
+          if(pose_.y >= 0)
+          {
+            pre_pose_y = (int)((pose_.y/QRDISTANCE*10 + 5)/10.0);
+          }
+          else
+            pre_pose_y = (int)((pose_.y/QRDISTANCE*10 - 5)/10.0);
+
+          pose_.x =  (float)pre_pose_x * QRDISTANCE + qr_float_.x;
+          pose_.y =  (float)pre_pose_y * QRDISTANCE + qr_float_.y;
+          pose_.theta = qr_float_.angle;
+        }
+*/
+
         //TODO:更新里程计。修正pose.
         float dist_x = computeDist(pose_.x, last_pose_.x);
         float dist_y = computeDist(pose_.y, last_pose_.y);
         const float TravelDist = sqrt(dist_x*dist_x + dist_y*dist_y);   //距离上一个二维码行驶过的距离。
         if(fabs(vx) > fabs(vy))                 //沿x轴方向移动。
         {
-          if((vx > 0) && (dist_x > 0.15))        //行驶距离大于15cm才计入下一个二维码的信息，滤除多次计入同一二维码。
-          {
-            last_pose_.x += QRDISTANCE;
-         //   last_pose_.y = qr_float_.y;
-            pose_.x = last_pose_.x + qr_float_.x;
-            pose_.y = last_pose_.y + qr_float_.y;             //误差累计，要保持POSE_Y为原始值。
-            pose_.theta = qr_float_.angle;
+//          if((vx > 0) && (dist_x > 0.15))        //行驶距离大于15cm才计入下一个二维码的信息，滤除多次计入同一二维码。
+//          {
+//            last_pose_.x += QRDISTANCE;
+//         //   last_pose_.y = qr_float_.y;
+//            pose_.x = last_pose_.x + qr_float_.x;
+//            pose_.y = last_pose_.y + qr_float_.y;             //误差累计，要保持POSE_Y为原始值。
+//            pose_.theta = qr_float_.angle;
+//
+//          }
+//          else if((vx < 0) && (dist_x > 0.15))
+//          {
+//            last_pose_.x -= QRDISTANCE;
+//           // last_pose_.y = qr_float_.y;
+//            pose_.x = last_pose_.x + qr_float_.x;
+//            pose_.y = last_pose_.y + qr_float_.y;
+//            pose_.theta = qr_float_.angle;
+//
+//          }
 
-          }
-          else if((vx < 0) && (dist_x > 0.15))
+          if(fabs(dist_x) > QRDISTANCE/2.0)      //行驶距离大于15cm才计入下一个二维码的信息，滤除多次计入同一二维码。
           {
-            last_pose_.x -= QRDISTANCE;
-           // last_pose_.y = qr_float_.y;
-            pose_.x = last_pose_.x + qr_float_.x;
-            pose_.y = last_pose_.y + qr_float_.y;
-            pose_.theta = qr_float_.angle;
-
-          }
-
-/*          if(fabs(dist_x) > QRDISTANCE/2.0)      //行驶距离大于15cm才计入下一个二维码的信息，滤除多次计入同一二维码。
-          {
+//            if(vx > 0)
+//              last_pose_.x += QRDISTANCE;
+//            else
+//              last_pose_.x -= QRDISTANCE;
+//
+//            pose_.x = last_pose_.x + qr_float_.x;
+//            pose_.y = last_pose_.y + qr_float_.y;
+//            pose_.theta = qr_float_.angle;
             if(vx > 0)
-              last_pose_.x += QRDISTANCE;
+              last_pose_.x += QRDISTANCE+recv_data.x;
             else
-              last_pose_.x -= QRDISTANCE;
+              last_pose_.x -= QRDISTANCE+recv_data.x;
 
-            pose_.x = last_pose_.x + qr_float_.x;
-            pose_.y = last_pose_.y + qr_float_.y;
-            pose_.theta = qr_float_.angle;
-          }*/
+            pose_.x = last_pose_.x;
+            pose_.y = last_pose_.y + recv_data.y;
+            pose_.theta = recv_data.angle;
+          }
           else
           {
             //update the pose.
@@ -377,21 +447,41 @@ void ServerSocket::odom()
           if((vy > 0) && (dist_y > 0.15))
           {
         //    last_pose_.x = qr_float_.y;
-            last_pose_.y += QRDISTANCE;
-            pose_.x = last_pose_.x + qr_float_.x;
-            pose_.y = last_pose_.y + qr_float_.y;
-            pose_.theta = qr_float_.angle;
+//            last_pose_.y += QRDISTANCE;
+//            pose_.x = last_pose_.x + qr_float_.x;
+//            pose_.y = last_pose_.y + qr_float_.y;
+//            pose_.theta = qr_float_.angle;
+
+            last_pose_.y += QRDISTANCE+recv_data.y;
+            pose_.x = last_pose_.x + recv_data.x;
+            pose_.y = last_pose_.y;
+            pose_.theta = recv_data.angle;
             std::cout << "odom update"<<std::endl;
           }
           else if((vy < 0) && (dist_y > 0.15))
           {
          //   last_pose_.x = qr_float_.y;
-            last_pose_.y -= QRDISTANCE;
-            pose_.x = last_pose_.x + qr_float_.x;
-            pose_.y = last_pose_.y + qr_float_.y;
-            pose_.theta = qr_float_.angle;
+//            last_pose_.y -= QRDISTANCE;
+//            pose_.x = last_pose_.x + qr_float_.x;
+//            pose_.y = last_pose_.y + qr_float_.y;
+//            pose_.theta = qr_float_.angle;
+            last_pose_.y -= QRDISTANCE+recv_data.y;
+            pose_.x = last_pose_.x + recv_data.x;
+            pose_.y = last_pose_.y;
+            pose_.theta = recv_data.angle;
 
           }
+//          if(fabs(dist_y) > (QRDISTANCE/2.0))
+//          {
+//            if(vy > 0)
+//              last_pose_.y += QRDISTANCE;
+//            else
+//              last_pose_.y -= QRDISTANCE;
+//
+//            pose_.x = last_pose_.x + qr_float_.x;
+//            pose_.y = last_pose_.y + qr_float_.y;
+//            pose_.theta = qr_float_.angle;
+//          }
           else
           {
             //update the pose.
@@ -399,27 +489,17 @@ void ServerSocket::odom()
             pose_.y = pose_.y + dx * sin(pose_.theta + dtheta/2.0) + dy * cos(pose_.theta + dtheta/2.0);
             pose_.theta = pose_.theta + dtheta;
           }
-/*          if(fabs(dist_y) > (QRDISTANCE/2.0))
-          {
-            if(vy > 0)
-              last_pose_.y += QRDISTANCE;
-            else
-              last_pose_.y -= QRDISTANCE;
-
-            pose_.x = last_pose_.x + qr_float_.x;
-            pose_.y = last_pose_.y + qr_float_.y;
-            pose_.theta = qr_float_.angle;
-          }*/
 
         }
         else
         {
-          if(qr_float_.num == 1)
+/*          if(recv_data.num == 1)
           {
-            pose_.x = qr_float_.x;
-            pose_.y = qr_float_.y;
-            pose_.theta = qr_float_.angle;
-          }
+            pose_.x = recv_data.x;
+            pose_.y = recv_data.y;
+            pose_.theta = recv_data.angle;
+          }*/
+          goto normal_odom;
         }
       }
       else      //正常的里程计。
@@ -490,11 +570,11 @@ normal_odom:
       QR_odom_msg.twist.linear.y = odom_msg_.twist.twist.linear.y;
       QR_odom_msg.twist.angular.z = odom_msg_.twist.twist.angular.z;
         //QR info
-      QR_odom_msg.qr.Tagnum = QR_info_.num;
-      QR_odom_msg.qr.x = QR_info_.x;    //mm
-      QR_odom_msg.qr.y = QR_info_.y;    //mm
-      QR_odom_msg.qr.angle = angleMapAndRad(QR_info_.angle);  //rad.
-//      std::cout << "Tag_num=" << QR_odom_msg.qr.Tagnum << std::endl;
+      QR_odom_msg.QRtag.Tagnum = recv_data.num;
+      QR_odom_msg.QRtag.x = recv_data.x;    //mm
+      QR_odom_msg.QRtag.y = recv_data.y;    //mm
+      QR_odom_msg.QRtag.angle = angleMapAndRad(recv_data.angle);  //rad.
+//      std::cout << "Tag_num=" << QR_odom_msg.QRtag.Tagnum << std::endl;
       //publish.
       odom_pub_.publish(odom_msg_);
       QR_odom_pub_.publish(QR_odom_msg);      //发布二维码数据。
@@ -504,104 +584,148 @@ normal_odom:
   }
 
 }
-void ServerSocket::alignInit()
+
+void ServerSocket::rawOdom()
 {
   while(true)
   {
-    nh_.param("align_first", this->align_first_, true); //自动调整。
-    QRfloat qr_data;
-
-    bool x_aligning = false, y_aligning = false, yaw_aligning = false;
+    ROS_DEBUG_THROTTLE(60, "rawOdom thread is alive!"); //用来测试线程活着.60s输出一次.
+    nh_.param("odom_reset", this->odom_reset_, false);
+    nh_.param("align_first", this->align_first_, false);
+    nh_.param("odom_scale_x", odom_scale_x_, 1.0);
+    nh_.param("odom_scale_y", odom_scale_y_, 1.0);
+    nh_.param("odom_scale_yaw", odom_scale_yaw_, 1.0);
+    current_time_ = ros::Time::now();
+    float vx = 0.0, vy = 0.0, vw = 0.0;
     if(feedbackVel_mutex_.try_lock())
     {
-      qr_data = qr_float_;
-//      std::cout << "error_x=" << qr_data.x << std::endl;
-//      std::cout << "error_y=" << qr_data.y << std::endl;
-//      std::cout << "error_yaw=" << qr_data.angle << std::endl;
+      FeedbackData recv_data = recv_data_;
       feedbackVel_mutex_.unlock();
-      if(!qr_data.num)
+      vx = recv_data.vel[0];
+      vy = recv_data.vel[1];
+      vw = recv_data.vel[2];
+      //calculate the displacement.
+      const float dt = (current_time_ - last_time_).toSec();
+      if(dt < 0)
+      {
+        ROS_ERROR("we can't calculate past odometry.");
         continue;
-/*      if((fabs(qr_data.x) >= POSITION_TOLERANCE) ||
-          (fabs(qr_data.y) >= POSITION_TOLERANCE) ||
-          (fabs(qr_data.angle) >= ANGLE_TOLERANCE))
+      }
+      const float dx = vx * dt * odom_scale_x_;
+      const float dy = vy * dt * odom_scale_y_;
+      const float dtheta = vw * dt * odom_scale_yaw_;
+//      printf("(%.3f, %.3f, %.3f)\n", vx,vy,vw);
+       //正常的里程计。
       {
-        if(fabs(qr_data.x) >= POSITION_TOLERANCE)
-          x_aligning = true;
-        else
-          x_aligning = false;
-        if(fabs(qr_data.y) >= POSITION_TOLERANCE)
-          y_aligning = true;
-        else
-          y_aligning = false;
-        if(fabs(qr_data.angle) >= ANGLE_TOLERANCE)
-          yaw_aligning = true;
-        else
-          yaw_aligning = false;
-      }*/
-
-
-      if((fabs(qr_data.x) < POSITION_TOLERANCE) && (fabs(qr_data.y) < POSITION_TOLERANCE) && fabs(qr_data.angle) < ANGLE_TOLERANCE)
+        //update the pose.
+        pose_.x = pose_.x + dx * cos(pose_.theta + dtheta/2.0) - dy * sin(pose_.theta + dtheta/2.0);
+        pose_.y = pose_.y + dx * sin(pose_.theta + dtheta/2.0) + dy * cos(pose_.theta + dtheta/2.0);
+        pose_.theta = pose_.theta + dtheta;
+      }
+      if(pose_.theta > M_PI)
+        pose_.theta = pose_.theta - 2*M_PI;
+      else if(pose_.theta < -M_PI)
+        pose_.theta = pose_.theta + 2*M_PI;
+      if(odom_reset_)   //添加一个service清零。
       {
-        x_aligning = false;
-        y_aligning = false;
-        yaw_aligning = false;
-        if(cmdVel_mutex_.try_lock())//调整完成，停止。
-        {
-            vel4f_[0] = 0.0;
-            vel4f_[1] = 0.0;
-            vel4f_[2] = 0.0;
-            vel4f_[3] = 0.0;
-            cmdVel_mutex_.unlock();
-         }
-        aligned_ = true;
+        pose_.x = pose_.y = pose_.theta = 0.0;
+        std::cout << "Odometry is reseted successfully!" << std::endl;
+        nh_.setParam("odom_reset", false);
+      }
 
-        align_ptr_->interrupt();        //关闭该线程。
+      ROS_DEBUG("THETA=%.3f", pose_.theta*(180/M_PI));     //输出里程计转过的角度，单位为度。
+
+      geometry_msgs::Quaternion quat = tf::createQuaternionMsgFromYaw(pose_.theta);
+
+      //publish the Transform odom->base_link.
+      odom_trans_.header.frame_id = "odom";
+      odom_trans_.child_frame_id = "base_footprint";
+      odom_trans_.header.stamp = current_time_;
+      odom_trans_.transform.translation.x = pose_.x;
+      odom_trans_.transform.translation.y = pose_.y;
+      odom_trans_.transform.translation.z = 0.0;
+      odom_trans_.transform.rotation = quat;
+
+      odom_broadcaster_.sendTransform(odom_trans_);
+      //QR header info.
+
+      //publish Odometry.
+      //pose.
+      odom_msg_.header.stamp = current_time_;
+      odom_msg_.header.frame_id = "odom";
+      odom_msg_.child_frame_id = "base_footprint";
+      odom_msg_.pose.pose.position.x = pose_.x;
+      odom_msg_.pose.pose.position.y = pose_.y;
+      odom_msg_.pose.pose.position.z = 0.0;
+      odom_msg_.pose.pose.orientation = quat;
+      odom_msg_.pose.covariance[0] = 0.001;
+      odom_msg_.pose.covariance[7] = 0.001;
+      odom_msg_.pose.covariance[14] = 1000000000000.0;
+      odom_msg_.pose.covariance[21] = 1000000000000.0;
+      odom_msg_.pose.covariance[28] = 1000000000000.0;
+      odom_msg_.pose.covariance[35] = 0.001;
+
+      //velocity.
+      odom_msg_.twist.twist.linear.x = vx;
+      odom_msg_.twist.twist.linear.y = vy;
+      odom_msg_.twist.twist.angular.z = vw;
+
+      //QR odom.
+        //pose
+      agvparking_msg::AgvOdom QR_odom_msg;
+       //四舍五入
+/*      int pre_pose_x = 0, pre_pose_y = 0;
+      if(pose_.x >= 0)
+      {
+       pre_pose_x = (int)((pose_.x/QRDISTANCE*10 + 5)/10.0);
       }
       else
+       pre_pose_x = (int)((pose_.x/QRDISTANCE*10 - 5)/10.0);
+      if(pose_.y >= 0)
       {
-        if(fabs(qr_data.x) >= POSITION_TOLERANCE)
-          x_aligning = true;
-        else
-          x_aligning = false;
-        if(fabs(qr_data.y) >= POSITION_TOLERANCE)
-          y_aligning = true;
-        else
-          y_aligning = false;
-        if(fabs(qr_data.angle) >= ANGLE_TOLERANCE)
-          yaw_aligning = true;
-        else
-          yaw_aligning = false;
+       pre_pose_y = (int)((pose_.y/QRDISTANCE*10 + 5)/10.0);
       }
+      else
+       pre_pose_y = (int)((pose_.y/QRDISTANCE*10 - 5)/10.0);
 
-      if(align_first_ && (x_aligning || y_aligning || yaw_aligning))
-      {
-        float vx = 0.0, vy = 0.0, vw = 0.0;
-        if(x_aligning)
-          vx = -SIGN(qr_data.x) * ALIGN_VEL;
-        if(y_aligning)
-          vy = -SIGN(qr_data.y) * ALIGN_VEL;
-        if(yaw_aligning)
-          vw = -SIGN(qr_data.angle) * ALIGN_VEL;
+      //fill header.
+      QR_odom_msg.header.stamp = current_time_;
+      QR_odom_msg.header.frame_id = "QR";
+      QR_odom_msg.child_frame_id = "base_footprint";
 
-        if(cmdVel_mutex_.try_lock())    //给定调整速度。
-        {
-          vel4f_[0] = vx;
-          vel4f_[1] = vy;
-          vel4f_[2] = vw;
-          vel4f_[3] = 0.0;
-          cmdVel_mutex_.unlock();
-        }
-      }
-/*      else if(align_first_ && !x_aligning && !y_aligning && !yaw_aligning)
-      {
-        aligned_ = true;
-        align_ptr_->interrupt();        //关闭该线程。
-      }*/
+      //pose
+      QR_odom_msg.pose.position.x =  (float)pre_pose_x * QRDISTANCE + qr_data.x;
+      QR_odom_msg.pose.position.y =  (float)pre_pose_y * QRDISTANCE + qr_data.y;
+      geometry_msgs::Quaternion qr_quat = tf::createQuaternionMsgFromYaw(qr_data.angle);
+      QR_odom_msg.pose.position.z = 0.0;
+      QR_odom_msg.pose.orientation = qr_quat;*/
 
+      //fill header.
+      QR_odom_msg.header.stamp = current_time_;
+      QR_odom_msg.header.frame_id = "QR";
+      QR_odom_msg.child_frame_id = "base_footprint";
+      //可保证里程计数据与QR数据的同步.
+      QR_odom_msg.pose.position.x = odom_msg_.pose.pose.position.x;
+      QR_odom_msg.pose.position.y = odom_msg_.pose.pose.position.y;
+      QR_odom_msg.pose.position.z = 0.0;
+      QR_odom_msg.pose.orientation = odom_msg_.pose.pose.orientation;
+        //velocity
+      QR_odom_msg.twist.linear.x = odom_msg_.twist.twist.linear.x;
+      QR_odom_msg.twist.linear.y = odom_msg_.twist.twist.linear.y;
+      QR_odom_msg.twist.angular.z = odom_msg_.twist.twist.angular.z;
+        //QR info
+      QR_odom_msg.QRtag.Tagnum = recv_data.num;
+      QR_odom_msg.QRtag.x = recv_data.x;    //mm
+      QR_odom_msg.QRtag.y = recv_data.y;    //mm
+      QR_odom_msg.QRtag.angle = angleMapAndRad(recv_data.angle);  //rad.
+
+      //publish.
+      odom_pub_.publish(odom_msg_);
+      QR_odom_pub_.publish(QR_odom_msg);      //发布二维码数据。
+      waitMilli(50);
+      last_time_ = current_time_;     //update last time.
     }
-    waitMilli(50);
   }
-  //publish.
 }
 
 float ServerSocket::angleMapAndRad(const unsigned short int &angle)
@@ -626,6 +750,50 @@ float ServerSocket::computeDist(const float &k1, const float &k2)
 {
   return fabs(k1 - k2);
 }
+
+ServerSocket::IntCmdVel ServerSocket::optimMoveAverageFilter(const ServerSocket::IntCmdVel& cmd_vel)
+{
+  IntCmdVel env;        //用于保存均值.
+  IntCmdVel droped_element;     //用于保存被挤出队列的那个元素.
+  if(cmd_buffer_.empty())
+  {
+      std::cout << "Filter buffer is empty!!"<<std::endl;
+      return last_cmd_;
+  }
+  static int filter_sum_vx = 0;  //第一次进入时的值.
+  static int filter_sum_vy = 0;
+  static int filter_sum_vw = 0;
+  if(cmd_buffer_.size() >= cmd_buf_size_)
+  {
+    droped_element = cmd_buffer_.front();       //为什么一直是0.构造函数会默认实现operator=,不需要手动实现.
+    cmd_buffer_.pop();
+    cmd_buffer_.push(cmd_vel);
+  }
+
+  if((short int)cmd_buffer_.size() == cmd_buf_size_)       //确保写入元素成功.
+  {
+    //TODO:计算平均值.
+    filter_sum_vx = (int)(filter_sum_vx + cmd_vel.vx - droped_element.vx);
+    filter_sum_vy = (int)(filter_sum_vy + cmd_vel.vy - droped_element.vy);
+    filter_sum_vw = (int)(filter_sum_vw + cmd_vel.vw - droped_element.vw);
+    //velocity.
+    env.vx = (short int)(filter_sum_vx / (short int)cmd_buffer_.size());
+    env.vy = (short int)(filter_sum_vy / (short int)cmd_buffer_.size());
+    env.vw = (short int)(filter_sum_vw / (short int)cmd_buffer_.size());
+    env.vz  = cmd_vel.vz;
+ //   printf("env=(%d, %d, %d, %d)\n", env.vx, env.vy, env.vw, env.vz);
+    //update last command.
+    last_cmd_ = env;
+  }
+  else
+  {
+    std::cout << "Filter write is Wrong!!"<<std::endl;
+    env = last_cmd_;
+  }
+
+  return env;
+}
+
 void waitMilli(int milliseconds)
 {
   boost::this_thread::sleep_for(boost::chrono::milliseconds(milliseconds));

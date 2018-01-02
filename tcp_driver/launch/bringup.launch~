@@ -15,10 +15,10 @@
 <!--    <param name="max_vx" value="0.73"/>-->
 <!--    <param name="max_vy" value="0.73"/>-->
 <!--    <param name="max_vw" value="0.41"/>-->
-    <param name="max_vx" value="0.5"/>
+    <param name="max_vx" value="0.6"/>
     <param name="max_vy" value="0.5"/>
     <param name="max_vw" value="0.35"/>
-    <param name="odom_reset" value="true"/>
+    <param name="odom_reset" value="false"/>
 	<param name="align_first" value="false"/>
     <param name="odom_scale_x" value="1.236"/>
     <param name="odom_scale_y" value="1.2"/>
@@ -28,5 +28,17 @@
 <!--    <remap from="/omni4wd_driver_node/odom" to="/odom"/>-->
   </node>
 
-  
+  <node pkg="qr_nav" type="qr_nav_node" name="qr_nav_node" output="screen" clear_params="true">
+<!--    <node pkg="qr_nav" type="square_qr_nav_node" name="square_qr_nav_node" output="screen" clear_params="true">-->
+
+<!--    <param name="serial_port" value="/dev/ttyUSB0"/>-->
+   <!--Add a rule file(40-omni4wd.rules)-->
+<!--    <param name="max_vx" value="0.73"/>-->
+<!--    <param name="max_vy" value="0.73"/>-->
+<!--    <param name="max_vw" value="0.41"/>-->
+	 <param name="navigation" value="false"/>
+   
+<!--    <remap from="/omni4wd_driver_node/cmd_vel" to="/cmd_vel"/>-->
+<!--    <remap from="/omni4wd_driver_node/odom" to="/odom"/>-->
+  </node>
 </launch>

@@ -120,7 +120,7 @@ include_directories(
 
 ## Declare a C++ library
 add_library(QRNavlib
-  src/error_align.cpp
+  src/align_error.cpp
 )
 
 ## Add cmake target dependencies of the library
@@ -129,14 +129,14 @@ add_library(QRNavlib
 add_dependencies(${agvparking_msg_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 
 ## Declare a C++ executable
-add_executable(qr_nav_node src/qr_nav_node.cpp)
+add_executable(square_qr_nav_node src/qr_nav.cpp)
 
 ## Add cmake target dependencies of the executable
 ## same as for the library above
 # add_dependencies(qr_nav_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 
 ## Specify libraries to link a library or executable target against
-target_link_libraries(qr_nav_node QRNavlib boost_chrono
+target_link_libraries(square_qr_nav_node QRNavlib boost_chrono
   ${catkin_LIBRARIES}
 )
 
